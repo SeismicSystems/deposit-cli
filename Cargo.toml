@@ -1,0 +1,24 @@
+[package]
+name = "deposit-cli"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+alloy = { version = "1.0", features = ["full"] }
+alloy-primitives = "1.2"
+alloy-rpc-types-engine = "1.0"
+anyhow = "1.0"
+clap = { version = "4.4", features = ["derive"] }
+tokio = { version = "1.46", features = ["full"] }
+
+# Commonware dependencies
+commonware-codec = "0.0.62"
+commonware-cryptography = "0.0.62"
+commonware-utils = "0.0.62"
+
+# Summit types from GitHub
+summit-types = { git = "https://github.com/SeismicSystems/summit", branch = "m/load-ckpt-cli" }
+
+[[bin]]
+name = "deposit-cli"
+path = "src/main.rs"
