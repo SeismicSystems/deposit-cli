@@ -12,12 +12,12 @@ clap = { version = "4.4", features = ["derive"] }
 tokio = { version = "1.46", features = ["full"] }
 
 # Commonware dependencies
-commonware-codec = "0.0.62"
-commonware-cryptography = "0.0.62"
-commonware-utils = "0.0.62"
+commonware-codec = { git = "https://github.com/commonwarexyz/monorepo.git", rev = "f395c9e" }
+commonware-cryptography = { git = "https://github.com/commonwarexyz/monorepo.git", rev = "f395c9e" }
+commonware-utils = { git = "https://github.com/commonwarexyz/monorepo.git", rev = "f395c9e" }
 
 # Summit types from GitHub
-summit-types = { git = "https://github.com/SeismicSystems/summit", branch = "m/load-ckpt-cli" }
+summit-types = { git = "https://github.com/SeismicSystems/summit", branch = "m/upgrade-commonware-0.0.63" }
 
 [[bin]]
 name = "deposit-cli"

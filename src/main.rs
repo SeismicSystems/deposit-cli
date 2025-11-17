@@ -6,9 +6,9 @@ use alloy::signers::local::PrivateKeySigner;
 use alloy_primitives::{keccak256, Address, U256};
 use anyhow::{anyhow, Context, Result};
 use clap::Parser;
-use commonware_codec::ReadExt;
+use commonware_codec::{Encode, ReadExt};
 use commonware_cryptography::Sha256;
-use commonware_cryptography::{ed25519::PrivateKey, Hasher, Signer};
+use commonware_cryptography::{bls12381, ed25519::PrivateKey, Hasher, Signer};
 use std::str::FromStr;
 use summit_types::execution_request::DepositRequest;
 
@@ -29,6 +29,10 @@ struct Args {
     /// Ed25519 private key in hex format (64 characters, no 0x prefix)
     #[arg(long)]
     ed25519_private_key: String,
+
+    /// BLS12-381 private key in hex format (64 characters, no 0x prefix)
+    #[arg(long)]
+    bls_private_key: String,
 
     /// Withdrawal credentials address (Ethereum address for withdrawals)
     #[arg(long)]
@@ -86,6 +90,26 @@ async fn main() -> Result<()> {
 
     println!("Ed25519 Public Key: {}", hex::encode(ed25519_pubkey_bytes));
 
+    // Parse BLS12-381 private key from hex
+    let bls_privkey_bytes = hex::decode(&args.bls_private_key)
+        .context("Invalid hex format for BLS private key")?;
+    if bls_privkey_bytes.len() != 32 {
+        return Err(anyhow!(
+            "BLS private key must be exactly 32 bytes (64 hex characters)"
+        ));
+    }
+
+    // Decode BLS private key using commonware codec
+    let bls_private_key = bls12381::PrivateKey::read(&mut bls_privkey_bytes.as_slice())
+        .context("Failed to decode BLS private key")?;
+
+    let bls_public_key = bls_private_key.public_key();
+    let bls_pubkey_bytes: [u8; 48] = bls_public_key.encode().as_ref()[..48]
+        .try_into()
+        .map_err(|_| anyhow!("Invalid BLS public key length"))?;
+
+    println!("BLS Public Key: {}", hex::encode(bls_pubkey_bytes));
+
     // Create withdrawal credentials (0x01 prefix for execution address withdrawal)
     let mut withdrawal_credentials = [0u8; 32];
     withdrawal_credentials[0] = 0x01; // ETH1 withdrawal prefix
@@ -95,20 +119,31 @@ async fn main() -> Result<()> {
 
     // Create deposit request and sign it
     let deposit_request = DepositRequest {
-        pubkey: ed25519_public_key,
+        node_pubkey: ed25519_public_key,
+        consensus_pubkey: bls_public_key.clone(),
         withdrawal_credentials,
         amount: args.amount_gwei,
-        signature: [0; 64],
+        node_signature: [0; 64],
+        consensus_signature: [0; 96],
         index: 0, // not included in the signature
     };
 
     let protocol_version_digest = Sha256::hash(&PROTOCOL_VERSION.to_le_bytes());
     let message = deposit_request.as_message(protocol_version_digest);
-    let signature = ed25519_private_key.sign(None, &message);
 
-    // Pad signature to 96 bytes (32 zeros + 64 byte signature)
-    let mut padded_signature = [0u8; 96];
-    padded_signature[32..96].copy_from_slice(signature.as_ref());
+    // Sign with node (ed25519) key
+    let node_signature = ed25519_private_key.sign(None, &message);
+    let node_signature_bytes: [u8; 64] = node_signature
+        .as_ref()
+        .try_into()
+        .map_err(|_| anyhow!("Invalid node signature length"))?;
+
+    // Sign with consensus (BLS) key
+    let consensus_signature = bls_private_key.sign(None, &message);
+    let consensus_signature_slice: &[u8] = consensus_signature.as_ref();
+    let consensus_signature_bytes: [u8; 96] = consensus_signature_slice
+        .try_into()
+        .map_err(|_| anyhow!("Invalid consensus signature length"))?;
 
     // Convert amount to wei
     let deposit_amount = U256::from(args.amount_gwei) * U256::from(1_000_000_000u64);
@@ -139,8 +174,10 @@ async fn main() -> Result<()> {
         deposit_contract,
         deposit_amount,
         &ed25519_pubkey_bytes,
+        &bls_pubkey_bytes,
         &withdrawal_credentials,
-        &padded_signature,
+        &node_signature_bytes,
+        &consensus_signature_bytes,
         nonce,
     )
     .await?;
@@ -150,49 +187,61 @@ async fn main() -> Result<()> {
         "  Ed25519 Public Key: {}",
         hex::encode(ed25519_pubkey_bytes)
     );
+    println!("  BLS Public Key: {}", hex::encode(bls_pubkey_bytes));
     println!("  Amount: {} gwei", args.amount_gwei);
     println!("  Withdrawal Address: {}", withdrawal_address);
 
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn send_deposit_transaction<P>(
     provider: &P,
     deposit_contract_address: Address,
     deposit_amount: U256,
-    ed25519_pubkey: &[u8; 32],
+    node_pubkey: &[u8; 32],
+    consensus_pubkey: &[u8; 48],
     withdrawal_credentials: &[u8; 32],
-    signature: &[u8; 96],
+    node_signature: &[u8; 64],
+    consensus_signature: &[u8; 96],
     nonce: u64,
 ) -> Result<()>
 where
     P: Provider + WalletProvider,
 {
-    // Left-pad ed25519 key to 48 bytes for the contract (prepend zeros)
-    let mut padded_pubkey = [0u8; 48];
-    padded_pubkey[16..48].copy_from_slice(ed25519_pubkey);
-
     // Compute the correct deposit data root for this transaction
     let deposit_data_root = compute_deposit_data_root(
-        ed25519_pubkey,
+        node_pubkey,
+        consensus_pubkey,
         withdrawal_credentials,
         deposit_amount,
-        signature,
+        node_signature,
+        consensus_signature,
     );
 
-    // Create deposit function call data: deposit(bytes,bytes,bytes,bytes32)
-    let function_selector = &keccak256("deposit(bytes,bytes,bytes,bytes32)")[0..4];
+    // Create deposit function call data: deposit(bytes,bytes,bytes,bytes,bytes,bytes32)
+    let function_selector = &keccak256("deposit(bytes,bytes,bytes,bytes,bytes,bytes32)")[0..4];
     let mut call_data = function_selector.to_vec();
 
-    // ABI encode parameters - calculate offsets for 4 parameters (3 dynamic + 1 fixed)
-    let offset_to_pubkey = 4 * 32;
-    let offset_to_withdrawal_creds = offset_to_pubkey + 32 + padded_pubkey.len().div_ceil(32) * 32;
-    let offset_to_signature =
+    // ABI encode parameters - calculate offsets for 6 parameters (5 dynamic + 1 fixed)
+    // Offsets start after the 6 parameter slots (6 * 32 bytes)
+    let offset_to_node_pubkey = 6 * 32;
+    let offset_to_consensus_pubkey =
+        offset_to_node_pubkey + 32 + node_pubkey.len().div_ceil(32) * 32;
+    let offset_to_withdrawal_creds =
+        offset_to_consensus_pubkey + 32 + consensus_pubkey.len().div_ceil(32) * 32;
+    let offset_to_node_signature =
         offset_to_withdrawal_creds + 32 + withdrawal_credentials.len().div_ceil(32) * 32;
+    let offset_to_consensus_signature =
+        offset_to_node_signature + 32 + node_signature.len().div_ceil(32) * 32;
 
     // Add parameter offsets
     let mut offset_bytes = vec![0u8; 32];
-    offset_bytes[28..32].copy_from_slice(&(offset_to_pubkey as u32).to_be_bytes());
+    offset_bytes[28..32].copy_from_slice(&(offset_to_node_pubkey as u32).to_be_bytes());
+    call_data.extend_from_slice(&offset_bytes);
+
+    offset_bytes.fill(0);
+    offset_bytes[28..32].copy_from_slice(&(offset_to_consensus_pubkey as u32).to_be_bytes());
     call_data.extend_from_slice(&offset_bytes);
 
     offset_bytes.fill(0);
@@ -200,7 +249,11 @@ where
     call_data.extend_from_slice(&offset_bytes);
 
     offset_bytes.fill(0);
-    offset_bytes[28..32].copy_from_slice(&(offset_to_signature as u32).to_be_bytes());
+    offset_bytes[28..32].copy_from_slice(&(offset_to_node_signature as u32).to_be_bytes());
+    call_data.extend_from_slice(&offset_bytes);
+
+    offset_bytes.fill(0);
+    offset_bytes[28..32].copy_from_slice(&(offset_to_consensus_signature as u32).to_be_bytes());
     call_data.extend_from_slice(&offset_bytes);
 
     // Add the fixed bytes32 parameter (deposit_data_root)
@@ -209,23 +262,35 @@ where
     // Add dynamic data
     let mut length_bytes = [0u8; 32];
 
-    // Padded pubkey (48 bytes) - already padded to 48, need to pad to next 32-byte boundary (64)
-    length_bytes[28..32].copy_from_slice(&(padded_pubkey.len() as u32).to_be_bytes());
+    // Node pubkey (32 bytes ed25519)
+    length_bytes[28..32].copy_from_slice(&(node_pubkey.len() as u32).to_be_bytes());
     call_data.extend_from_slice(&length_bytes);
-    call_data.extend_from_slice(&padded_pubkey);
+    call_data.extend_from_slice(node_pubkey);
+
+    // Consensus pubkey (48 bytes BLS)
+    length_bytes.fill(0);
+    length_bytes[28..32].copy_from_slice(&(consensus_pubkey.len() as u32).to_be_bytes());
+    call_data.extend_from_slice(&length_bytes);
+    call_data.extend_from_slice(consensus_pubkey);
     call_data.extend_from_slice(&[0u8; 16]); // Pad 48 to 64 bytes (next 32-byte boundary)
 
-    // Withdrawal credentials (32 bytes) - already aligned
+    // Withdrawal credentials (32 bytes)
     length_bytes.fill(0);
     length_bytes[28..32].copy_from_slice(&(withdrawal_credentials.len() as u32).to_be_bytes());
     call_data.extend_from_slice(&length_bytes);
     call_data.extend_from_slice(withdrawal_credentials);
 
-    // Signature (96 bytes) - already aligned to 32-byte boundary
+    // Node signature (64 bytes ed25519)
     length_bytes.fill(0);
-    length_bytes[28..32].copy_from_slice(&(signature.len() as u32).to_be_bytes());
+    length_bytes[28..32].copy_from_slice(&(node_signature.len() as u32).to_be_bytes());
     call_data.extend_from_slice(&length_bytes);
-    call_data.extend_from_slice(signature);
+    call_data.extend_from_slice(node_signature);
+
+    // Consensus signature (96 bytes BLS)
+    length_bytes.fill(0);
+    length_bytes[28..32].copy_from_slice(&(consensus_signature.len() as u32).to_be_bytes());
+    call_data.extend_from_slice(&length_bytes);
+    call_data.extend_from_slice(consensus_signature);
 
     let tx_request = TransactionRequest::default()
         .with_to(deposit_contract_address)
@@ -261,54 +326,73 @@ where
 }
 
 fn compute_deposit_data_root(
-    ed25519_pubkey: &[u8; 32],
+    node_pubkey: &[u8; 32],
+    consensus_pubkey: &[u8; 48],
     withdrawal_credentials: &[u8; 32],
     amount: U256,
-    signature: &[u8; 96],
+    node_signature: &[u8; 64],
+    consensus_signature: &[u8; 96],
 ) -> [u8; 32] {
     /*
-    bytes32 pubkey_root = sha256(abi.encodePacked(pubkey, bytes16(0)));
-    bytes32 signature_root = sha256(abi.encodePacked(
-        sha256(abi.encodePacked(signature[:64])),
-        sha256(abi.encodePacked(signature[64:], bytes32(0)))
+    Solidity computation:
+    bytes32 consensus_pubkey_hash = sha256(abi.encodePacked(consensus_pubkey, bytes16(0)));
+    bytes32 pubkey_root = sha256(abi.encodePacked(node_pubkey, consensus_pubkey_hash));
+    bytes32 node_signature_hash = sha256(node_signature);
+    bytes32 consensus_signature_hash = sha256(abi.encodePacked(
+        sha256(abi.encodePacked(consensus_signature[:64])),
+        sha256(abi.encodePacked(consensus_signature[64:], bytes32(0)))
     ));
+    bytes32 signature_root = sha256(abi.encodePacked(node_signature_hash, consensus_signature_hash));
     bytes32 node = sha256(abi.encodePacked(
         sha256(abi.encodePacked(pubkey_root, withdrawal_credentials)),
         sha256(abi.encodePacked(amount, bytes24(0), signature_root))
     ));
-     */
+    */
 
-    // Left-pad ed25519 key to 48 bytes (prepend zeros)
-    let mut padded_pubkey = [0u8; 48];
-    padded_pubkey[16..48].copy_from_slice(ed25519_pubkey);
-
-    // 1. pubkey_root = sha256(padded_pubkey || bytes16(0))
+    // 1. consensus_pubkey_hash = sha256(consensus_pubkey || bytes16(0))
     let mut hasher = Sha256::new();
-    hasher.update(&padded_pubkey);
+    hasher.update(consensus_pubkey);
     hasher.update(&[0u8; 16]); // bytes16(0)
+    let consensus_pubkey_hash = hasher.finalize();
+
+    // 2. pubkey_root = sha256(node_pubkey || consensus_pubkey_hash)
+    let mut hasher = Sha256::new();
+    hasher.update(node_pubkey);
+    hasher.update(&consensus_pubkey_hash);
     let pubkey_root = hasher.finalize();
 
-    // 2. signature_root = sha256(sha256(signature[0:64]) || sha256(signature[64:96] || bytes32(0)))
+    // 3. node_signature_hash = sha256(node_signature)
     let mut hasher = Sha256::new();
-    hasher.update(&signature[0..64]);
-    let sig_part1 = hasher.finalize();
+    hasher.update(node_signature);
+    let node_signature_hash = hasher.finalize();
+
+    // 4. consensus_signature_hash = sha256(sha256(consensus_signature[0:64]) || sha256(consensus_signature[64:96] || bytes32(0)))
+    let mut hasher = Sha256::new();
+    hasher.update(&consensus_signature[0..64]);
+    let consensus_sig_part1 = hasher.finalize();
 
     let mut hasher = Sha256::new();
-    hasher.update(&signature[64..96]);
+    hasher.update(&consensus_signature[64..96]);
     hasher.update(&[0u8; 32]); // bytes32(0)
-    let sig_part2 = hasher.finalize();
+    let consensus_sig_part2 = hasher.finalize();
 
     let mut hasher = Sha256::new();
-    hasher.update(&sig_part1);
-    hasher.update(&sig_part2);
+    hasher.update(&consensus_sig_part1);
+    hasher.update(&consensus_sig_part2);
+    let consensus_signature_hash = hasher.finalize();
+
+    // 5. signature_root = sha256(node_signature_hash || consensus_signature_hash)
+    let mut hasher = Sha256::new();
+    hasher.update(&node_signature_hash);
+    hasher.update(&consensus_signature_hash);
     let signature_root = hasher.finalize();
 
-    // 3. Convert amount to 8-byte little-endian (gwei)
+    // 6. Convert amount to 8-byte little-endian (gwei)
     let amount_gwei = amount / U256::from(10).pow(U256::from(9)); // Convert wei to gwei
     let amount_u64 = amount_gwei.to::<u64>(); // Convert to u64 (should fit for reasonable amounts)
     let amount_bytes = amount_u64.to_le_bytes(); // 8 bytes little-endian
 
-    // 4. node = sha256(sha256(pubkey_root || withdrawal_credentials) || sha256(amount || bytes24(0) || signature_root))
+    // 7. node = sha256(sha256(pubkey_root || withdrawal_credentials) || sha256(amount || bytes24(0) || signature_root))
     let mut hasher = Sha256::new();
     hasher.update(&pubkey_root);
     hasher.update(withdrawal_credentials);
